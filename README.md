@@ -1,6 +1,6 @@
 # LLM Verifier
 
-Local FastAPI webapp for managing chat threads, system prompts, and multi-model verification (primary + verifier) with streaming.
+Local FastAPI webapp for managing chat threads, system prompts, and multi-agent verification (master + responder/verifier/polisher) with streaming.
 
 ## Run
 
@@ -33,6 +33,7 @@ Logs are written to `logs\server.log` and also printed to the console when using
 - Streaming chat uses `/api/threads/{thread_id}/messages/stream` (SSE).
 - Supported models: Azure OpenAI and Azure Grok (Entra ID), plus Gemini (API key).
 - Threads auto-title using the primary model after each exchange.
+- Master agent uses dynamic routing: if a task is simple and responder confidence is above the configured threshold, verifier can be skipped and output goes directly to polisher.
 
 ## Azure OpenAI (Entra ID)
 
@@ -49,6 +50,18 @@ Example `config/models.json`:
   "primary_model_id": "azure-openai",
   "verifier_model_id": "gemini",
   "verifier_enabled": false,
+  "agents": {
+    "responder_model_id": "azure-openai",
+    "verifier_model_id": "gemini",
+    "polisher_model_id": "azure-openai"
+  },
+  "routing": {
+    "confidence_threshold": 0.95,
+    "enable_verifier_shortcut": true
+  },
+  "tools": {
+    "web_search_enabled": true
+  },
   "models": [
     {
       "id": "azure-openai",
