@@ -162,6 +162,12 @@ select {
   align-self: flex-start;
 }
 
+.message.role-draft {
+  align-self: flex-start;
+  border: 1px dashed #475569;
+  background: #0b1324;
+}
+
 .message .meta {
   font-size: 12px;
   color: #94a3b8;

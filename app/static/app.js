@@ -19,6 +19,9 @@ const primaryModelSelect = document.getElementById("primary-model");
 const verifierModelSelect = document.getElementById("verifier-model");
 const verifierEnabledToggle = document.getElementById("verifier-enabled");
 const verifierToggleStatus = document.getElementById("verifier-toggle-status");
+const routingThresholdInput = document.getElementById("routing-threshold");
+const routingShortcutToggle = document.getElementById("routing-shortcut-enabled");
+const webSearchToggle = document.getElementById("web-search-enabled");
 const modelConfigsContainer = document.getElementById("model-configs");
 const saveConfigBtn = document.getElementById("save-config");
 const imageInput = document.getElementById("image-input");
@@ -303,6 +306,8 @@ function renderMessages(shouldScroll = true) {
       div.classList.add("role-user");
     } else if (msg.role === "assistant") {
       div.classList.add("role-assistant");
+    } else if (msg.role === "assistant_draft") {
+      div.classList.add("role-draft");
     } else if (msg.role === "verifier") {
       div.classList.add("role-verifier");
     }
@@ -334,6 +339,19 @@ function renderMessages(shouldScroll = true) {
 
 function renderConfig() {
   if (!state.config) return;
+  if (!state.config.agents) {
+    state.config.agents = {
+      responder_model_id: state.config.primary_model_id,
+      verifier_model_id: state.config.verifier_model_id,
+      polisher_model_id: state.config.primary_model_id,
+    };
+  }
+  if (!state.config.routing) {
+    state.config.routing = { confidence_threshold: 0.95, enable_verifier_shortcut: true };
+  }
+  if (!state.config.tools) {
+    state.config.tools = { web_search_enabled: true };
+  }
   primaryModelSelect.innerHTML = "";
   verifierModelSelect.innerHTML = "";
   modelConfigsContainer.innerHTML = "";
@@ -378,6 +396,9 @@ function renderConfig() {
   primaryModelSelect.value = state.config.primary_model_id;
   verifierModelSelect.value = state.config.verifier_model_id;
   verifierEnabledToggle.checked = !!state.config.verifier_enabled;
+  routingThresholdInput.value = state.config.routing.confidence_threshold ?? 0.95;
+  routingShortcutToggle.checked = !!state.config.routing.enable_verifier_shortcut;
+  webSearchToggle.checked = !!state.config.tools.web_search_enabled;
   updateVerifierToggleUI();
 }
 
@@ -464,21 +485,19 @@ async function sendMessage(event) {
   state.messages.push(userMessage);
   renderMessages();
 
+  const responderDraftMessage = {
+    role: "assistant_draft",
+    content: "",
+    model: state.config && state.config.agents ? state.config.agents.responder_model_id : null,
+  };
   const assistantMessage = {
     role: "assistant",
     content: "",
-    model: state.config ? state.config.primary_model_id : null,
+    model: state.config && state.config.agents ? state.config.agents.polisher_model_id : null,
   };
   let verifierMessage = null;
+  state.messages.push(responderDraftMessage);
   state.messages.push(assistantMessage);
-  if (state.config && state.config.verifier_enabled) {
-    verifierMessage = {
-      role: "verifier",
-      content: "",
-      model: state.config.verifier_model_id,
-    };
-    state.messages.push(verifierMessage);
-  }
   renderMessages();
 
   if (currentStreamController) {
@@ -517,9 +536,14 @@ async function sendMessage(event) {
       buffer += decoder.decode(value, { stream: true });
       const parts = buffer.split("\n\n");
       buffer = parts.pop() || "";
-      parts.forEach((chunk) =>
-        handleSseChunk(chunk, assistantMessage, verifierMessage)
-      );
+      parts.forEach((chunk) => {
+        verifierMessage = handleSseChunk(
+          chunk,
+          responderDraftMessage,
+          assistantMessage,
+          verifierMessage
+        );
+      });
     }
   } finally {
     isStreaming = false;
@@ -527,7 +551,7 @@ async function sendMessage(event) {
   }
 }
 
-function handleSseChunk(chunk, assistantMessage, verifierMessage) {
+function handleSseChunk(chunk, responderDraftMessage, assistantMessage, verifierMessage) {
   const lines = chunk.split("\n");
   let event = "message";
   let data = "";
@@ -538,35 +562,57 @@ function handleSseChunk(chunk, assistantMessage, verifierMessage) {
       data += line.slice(5).trim();
     }
   });
-  if (!data) return;
+  if (!data) return verifierMessage;
   const payload = JSON.parse(data);
   if (event === "status") {
-    if (payload.stage === "primary") {
+    if (payload.stage === "responder") {
+      responderDraftMessage.status = payload.status;
+    } else if (payload.stage === "polisher") {
       assistantMessage.status = payload.status;
-    } else if (payload.stage === "verifier" && verifierMessage) {
+    } else if (payload.stage === "verifier") {
+      if (!verifierMessage) {
+        verifierMessage = {
+          role: "verifier",
+          content: "",
+          model: state.config && state.config.agents ? state.config.agents.verifier_model_id : null,
+        };
+        const assistantIndex = state.messages.indexOf(assistantMessage);
+        if (assistantIndex >= 0) {
+          state.messages.splice(assistantIndex, 0, verifierMessage);
+        } else {
+          state.messages.push(verifierMessage);
+        }
+      }
       verifierMessage.status = payload.status;
     }
     renderMessages(!isStreaming);
-    return;
+    return verifierMessage;
   }
   if (event === "token") {
-    if (payload.stage === "primary") {
+    if (payload.stage === "responder") {
+      responderDraftMessage.content += payload.delta;
+    } else if (payload.stage === "polisher") {
       assistantMessage.content += payload.delta;
     } else if (payload.stage === "verifier" && verifierMessage) {
       verifierMessage.content += payload.delta;
     }
     renderMessages(!isStreaming);
-    return;
+    return verifierMessage;
   }
   if (event === "saved") {
     const msg = payload.message;
     if (msg.role === "assistant") {
       Object.assign(assistantMessage, msg);
+    } else if (msg.role === "assistant_draft") {
+      Object.assign(responderDraftMessage, msg);
     } else if (msg.role === "verifier" && verifierMessage) {
       Object.assign(verifierMessage, msg);
     }
     renderMessages(!isStreaming);
-    return;
+    return verifierMessage;
+  }
+  if (event === "routing") {
+    return verifierMessage;
   }
   if (event === "title") {
     const updated = payload.thread;
@@ -580,15 +626,16 @@ function handleSseChunk(chunk, assistantMessage, verifierMessage) {
       threadTitleInput.value = updated.title || "";
     }
     renderThreads();
-    return;
+    return verifierMessage;
   }
   if (event === "done") {
     isStreaming = false;
-    return;
+    return verifierMessage;
   }
   if (event === "error") {
     alert(payload.message || "Streaming error");
   }
+  return verifierMessage;
 }
 
 async function loadSystemPrompt() {
@@ -614,6 +661,17 @@ async function saveConfig() {
   updated.primary_model_id = primaryModelSelect.value;
   updated.verifier_model_id = verifierModelSelect.value;
   updated.verifier_enabled = verifierEnabledToggle.checked;
+  updated.agents = updated.agents || {};
+  updated.agents.responder_model_id = primaryModelSelect.value;
+  updated.agents.verifier_model_id = verifierModelSelect.value;
+  if (!updated.agents.polisher_model_id) {
+    updated.agents.polisher_model_id = primaryModelSelect.value;
+  }
+  updated.routing = updated.routing || {};
+  updated.routing.confidence_threshold = Number(routingThresholdInput.value || "0.95");
+  updated.routing.enable_verifier_shortcut = !!routingShortcutToggle.checked;
+  updated.tools = updated.tools || {};
+  updated.tools.web_search_enabled = !!webSearchToggle.checked;
   document
     .querySelectorAll("#model-configs input, #model-configs textarea")
     .forEach((input) => {
