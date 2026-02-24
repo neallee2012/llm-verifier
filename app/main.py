@@ -24,8 +24,14 @@ from app.db.database import (
     set_setting,
     update_thread_title,
 )
-from app.services.llm import call_model, stream_model
-from app.services.model_config import find_model, load_config, save_config
+from app.services.llm import call_model
+from app.services.model_config import (
+    find_model,
+    load_config,
+    resolve_agent_model_id,
+    save_config,
+)
+from app.services.orchestration import MultiAgentService
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -174,7 +180,8 @@ async def api_add_message(thread_id: str, payload: MessageCreate) -> dict[str, A
         raise HTTPException(status_code=404, detail="Thread not found")
 
     user_message = add_message(thread_id, "user", payload.content, images=payload.images or None)
-    history = _build_history(thread_id)
+    responder_history = _build_history(thread_id)
+    text_history = _build_history(thread_id, include_images=False)
     system_prompt = get_setting("system_prompt", "")
 
     config = load_config()
@@ -183,52 +190,59 @@ async def api_add_message(thread_id: str, payload: MessageCreate) -> dict[str, A
         if payload.verifier_enabled is not None
         else bool(config.get("verifier_enabled"))
     )
-    primary_model = find_model(config, config.get("primary_model_id"))
-    verifier_model = None
-    if verifier_enabled:
-        verifier_model = find_model(config, config.get("verifier_model_id"))
-    primary_instructions = _merge_instructions(
-        system_prompt, primary_model.get("instructions")
-    )
+    service = MultiAgentService(config, system_prompt)
 
     try:
-        primary_response = await call_model(
-            primary_model, history, primary_instructions
+        orchestration = await service.run(
+            thread_id=thread_id,
+            user_message=payload.content,
+            responder_history=responder_history,
+            text_history=text_history,
+            verifier_enabled=verifier_enabled,
         )
-        verifier_response = None
-        if verifier_enabled:
-            verifier_prompt = (
-                "You are an industry expert and consultant. Review the primary assistant "
-                "response for accuracy, completeness, and relevance. Use the primary response "
-                "as input, provide an executive summary, then start to correct any issues, and provide the final answer to the user. "
-            )
-            verifier_prompt = _merge_instructions(
-                verifier_prompt, system_prompt, verifier_model.get("instructions")
-            )
-            verifier_messages = [
-                *_build_history(thread_id, include_images=False),
-                {"role": "assistant", "content": primary_response},
-            ]
-            verifier_response = await call_model(
-                verifier_model, verifier_messages, verifier_prompt
-            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="LLM request failed") from exc
 
-    assistant_message = add_message(
-        thread_id, "assistant", primary_response, model=primary_model["id"]
+    responder_model_id = resolve_agent_model_id(config, "responder")
+    verifier_model_id = resolve_agent_model_id(config, "verifier")
+    polisher_model_id = resolve_agent_model_id(config, "polisher")
+    responder_message = add_message(
+        thread_id,
+        "assistant_draft",
+        orchestration.responder.content,
+        model=responder_model_id,
     )
     verifier_message = None
-    if verifier_enabled:
+    if orchestration.verifier is not None:
         verifier_message = add_message(
-            thread_id, "verifier", verifier_response, model=verifier_model["id"]
+            thread_id,
+            "verifier",
+            orchestration.verifier.content,
+            model=verifier_model_id,
         )
-    updated_thread = await _maybe_update_thread_title(thread_id, primary_model)
-    response: dict[str, Any] = {"messages": [user_message, assistant_message]}
+    assistant_message = add_message(
+        thread_id,
+        "assistant",
+        orchestration.polisher.content,
+        model=polisher_model_id,
+    )
+    title_model = find_model(config, polisher_model_id)
+    updated_thread = await _maybe_update_thread_title(thread_id, title_model)
+    response: dict[str, Any] = {
+        "messages": [user_message, responder_message, assistant_message],
+        "routing": {
+            "path": orchestration.decision.path,
+            "reason": orchestration.decision.reason,
+            "skipped_verifier": orchestration.decision.skipped_verifier,
+            "confidence_threshold": orchestration.decision.confidence_threshold,
+            "responder_confidence": orchestration.decision.responder_confidence,
+            "is_simple_task": orchestration.decision.is_simple_task,
+        },
+    }
     if verifier_message:
-        response["messages"].append(verifier_message)
+        response["messages"].insert(2, verifier_message)
     if updated_thread:
         response["thread"] = updated_thread
     return response
@@ -242,7 +256,8 @@ async def api_stream_message(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     user_message = add_message(thread_id, "user", payload.content, images=payload.images or None)
-    history = _build_history(thread_id)
+    responder_history = _build_history(thread_id)
+    text_history = _build_history(thread_id, include_images=False)
     system_prompt = get_setting("system_prompt", "")
 
     config = load_config()
@@ -251,35 +266,31 @@ async def api_stream_message(
         if payload.verifier_enabled is not None
         else bool(config.get("verifier_enabled"))
     )
-    primary_model = find_model(config, config.get("primary_model_id"))
-    verifier_model = None
-    if verifier_enabled:
-        verifier_model = find_model(config, config.get("verifier_model_id"))
-    primary_instructions = _merge_instructions(
-        system_prompt, primary_model.get("instructions")
-    )
+    service = MultiAgentService(config, system_prompt)
+    responder_model_id = resolve_agent_model_id(config, "responder")
+    verifier_model_id = resolve_agent_model_id(config, "verifier")
+    polisher_model_id = resolve_agent_model_id(config, "polisher")
 
     async def event_stream() -> Any:
-        yield f"event: status\ndata: {json.dumps({'stage': 'primary', 'status': 'started'})}\n\n"
-        primary_text = ""
+        agent_outputs: dict[str, dict[str, Any]] = {}
         try:
-            streaming_text = ""
-
-            def _capture_primary_final(text: str) -> None:
-                nonlocal primary_text
-                primary_text = text
-
-            async for chunk in stream_model(
-                primary_model,
-                history,
-                primary_instructions,
-                on_final_text=_capture_primary_final,
+            async for event in service.stream(
+                thread_id=thread_id,
+                user_message=payload.content,
+                responder_history=responder_history,
+                text_history=text_history,
+                verifier_enabled=verifier_enabled,
             ):
-                streaming_text += chunk
-                yield f"event: token\ndata: {json.dumps({'stage': 'primary', 'delta': chunk})}\n\n"
-            if streaming_text and len(streaming_text) > len(primary_text):
-                primary_text = streaming_text
-            yield f"event: status\ndata: {json.dumps({'stage': 'primary', 'status': 'done'})}\n\n"
+                if await request.is_disconnected():
+                    return
+                event_type = event.get("event", "message")
+                payload_data = {k: v for k, v in event.items() if k != "event"}
+                if event_type == "agent_output":
+                    stage = payload_data.get("stage")
+                    if isinstance(stage, str):
+                        agent_outputs[stage] = payload_data
+                    continue
+                yield f"event: {event_type}\ndata: {json.dumps(payload_data)}\n\n"
         except ValueError as exc:
             yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
             return
@@ -287,49 +298,37 @@ async def api_stream_message(
             yield f"event: error\ndata: {json.dumps({'message': 'LLM request failed'})}\n\n"
             return
 
-        assistant_message = add_message(
-            thread_id, "assistant", primary_text, model=primary_model["id"]
-        )
-        yield f"event: saved\ndata: {json.dumps({'message': assistant_message})}\n\n"
-
-        verifier_message = None
-        if verifier_enabled:
-            verifier_prompt = (
-                "You are an industry expert and consultant. Review the primary assistant "
-                "response for accuracy, completeness, and relevance. Use the primary response "
-                "as input, illustrate your judgment first and list issues you find, then correct any issues, and provide the final answer to the user. "
-                "Respond with the final answer only."
+        responder_output = agent_outputs.get("responder")
+        polisher_output = agent_outputs.get("polisher")
+        verifier_output = agent_outputs.get("verifier")
+        if responder_output:
+            responder_message = add_message(
+                thread_id,
+                "assistant_draft",
+                responder_output.get("content", ""),
+                model=responder_output.get("model") or responder_model_id,
             )
-            verifier_prompt = _merge_instructions(
-                verifier_prompt, system_prompt, verifier_model.get("instructions")
-            )
-            verifier_messages = [
-                *_build_history(thread_id, include_images=False),
-                {"role": "assistant", "content": primary_text},
-            ]
-
-            yield f"event: status\ndata: {json.dumps({'stage': 'verifier', 'status': 'started'})}\n\n"
-            verifier_text = ""
-            try:
-                async for chunk in stream_model(
-                    verifier_model, verifier_messages, verifier_prompt
-                ):
-                    verifier_text += chunk
-                    yield f"event: token\ndata: {json.dumps({'stage': 'verifier', 'delta': chunk})}\n\n"
-                yield f"event: status\ndata: {json.dumps({'stage': 'verifier', 'status': 'done'})}\n\n"
-            except ValueError as exc:
-                yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
-                return
-            except httpx.HTTPError as exc:
-                logger.error("Verifier LLM request failed: %s", exc)
-                yield f"event: error\ndata: {json.dumps({'message': 'Verifier LLM request failed'})}\n\n"
-                return
-
+            yield f"event: saved\ndata: {json.dumps({'message': responder_message})}\n\n"
+        if verifier_output:
             verifier_message = add_message(
-                thread_id, "verifier", verifier_text, model=verifier_model["id"]
+                thread_id,
+                "verifier",
+                verifier_output.get("content", ""),
+                model=verifier_output.get("model") or verifier_model_id,
             )
             yield f"event: saved\ndata: {json.dumps({'message': verifier_message})}\n\n"
-        updated_thread = await _maybe_update_thread_title(thread_id, primary_model)
+        if not polisher_output:
+            yield f"event: error\ndata: {json.dumps({'message': 'Polisher output missing'})}\n\n"
+            return
+        assistant_message = add_message(
+            thread_id,
+            "assistant",
+            polisher_output.get("content", ""),
+            model=polisher_output.get("model") or polisher_model_id,
+        )
+        yield f"event: saved\ndata: {json.dumps({'message': assistant_message})}\n\n"
+        title_model = find_model(config, polisher_model_id)
+        updated_thread = await _maybe_update_thread_title(thread_id, title_model)
         if updated_thread:
             yield f"event: title\ndata: {json.dumps({'thread': updated_thread})}\n\n"
         yield "event: done\ndata: {}\n\n"

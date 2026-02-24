@@ -11,6 +11,18 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "primary_model_id": "azure-openai",
     "verifier_model_id": "gemini",
     "verifier_enabled": False,
+    "agents": {
+        "responder_model_id": "azure-openai",
+        "verifier_model_id": "gemini",
+        "polisher_model_id": "azure-openai",
+    },
+    "routing": {
+        "confidence_threshold": 0.95,
+        "enable_verifier_shortcut": True,
+    },
+    "tools": {
+        "web_search_enabled": True,
+    },
     "models": [
         {
             "id": "azure-openai",
@@ -58,6 +70,30 @@ def _apply_defaults(config: dict[str, Any]) -> bool:
     if "verifier_enabled" not in config:
         config["verifier_enabled"] = _DEFAULT_CONFIG["verifier_enabled"]
         updated = True
+    if "agents" not in config or not isinstance(config.get("agents"), dict):
+        config["agents"] = json.loads(json.dumps(_DEFAULT_CONFIG["agents"]))
+        updated = True
+    else:
+        for key, value in _DEFAULT_CONFIG["agents"].items():
+            if key not in config["agents"]:
+                config["agents"][key] = value
+                updated = True
+    if "routing" not in config or not isinstance(config.get("routing"), dict):
+        config["routing"] = json.loads(json.dumps(_DEFAULT_CONFIG["routing"]))
+        updated = True
+    else:
+        for key, value in _DEFAULT_CONFIG["routing"].items():
+            if key not in config["routing"]:
+                config["routing"][key] = value
+                updated = True
+    if "tools" not in config or not isinstance(config.get("tools"), dict):
+        config["tools"] = json.loads(json.dumps(_DEFAULT_CONFIG["tools"]))
+        updated = True
+    else:
+        for key, value in _DEFAULT_CONFIG["tools"].items():
+            if key not in config["tools"]:
+                config["tools"][key] = value
+                updated = True
 
     models = config.get("models")
     defaults = _DEFAULT_CONFIG["models"]
@@ -107,3 +143,16 @@ def find_model(config: dict[str, Any], model_id: str | None) -> dict[str, Any]:
         if model.get("id") == model_id:
             return model
     raise ValueError(f"Model id '{model_id}' not found")
+
+
+def resolve_agent_model_id(config: dict[str, Any], agent_id: str) -> str | None:
+    agents = config.get("agents", {})
+    if isinstance(agents, dict):
+        mapped = agents.get(f"{agent_id}_model_id")
+        if mapped:
+            return mapped
+    if agent_id in {"responder", "polisher"}:
+        return config.get("primary_model_id")
+    if agent_id == "verifier":
+        return config.get("verifier_model_id")
+    return None
