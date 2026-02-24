@@ -2,4 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 azure-identity
+--pre
+agent-framework
 
