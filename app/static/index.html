@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM Verifier</title>
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
+</head>
+<body>
+  <header>
+    <h1>LLM Verifier</h1>
+  </header>
+  <main>
+    <section class="sidebar">
+      <div class="section">
+        <h2>Threads</h2>
+        <button id="new-thread">New Thread</button>
+        <ul id="thread-list"></ul>
+      </div>
+      <div class="section">
+        <h2>System Prompt</h2>
+        <textarea id="system-prompt" rows="6"></textarea>
+        <button id="save-system-prompt">Save Prompt</button>
+      </div>
+      <div class="section">
+        <h2>Model Config</h2>
+        <div class="field">
+          <label>Primary Model</label>
+          <select id="primary-model"></select>
+        </div>
+        <div class="field">
+          <label>Verifier Model</label>
+          <select id="verifier-model"></select>
+        </div>
+        <div class="field checkbox-field">
+          <label class="toggle-label">
+            <input type="checkbox" id="verifier-enabled" />
+            Verifier
+            <span id="verifier-toggle-status" class="toggle-status">OFF</span>
+          </label>
+        </div>
+        <div id="model-configs"></div>
+        <button id="save-config">Save Config</button>
+      </div>
+    </section>
+    <section class="chat">
+      <div id="chat-header">
+        <input id="thread-title" placeholder="Thread title" />
+        <button id="save-title">Save Title</button>
+        <button id="delete-thread" class="danger">Delete</button>
+      </div>
+      <div id="messages"></div>
+      <form id="chat-form">
+        <textarea id="chat-input" rows="3" placeholder="Type your message"></textarea>
+        <div class="chat-actions">
+          <label class="upload-btn" title="Upload image">
+            <input type="file" id="image-input" accept="image/*" multiple hidden />
+            📎
+          </label>
+          <button type="submit">Send</button>
+        </div>
+      </form>
+      <div id="image-preview" class="image-preview"></div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=6"></script>
+</body>
+</html>
