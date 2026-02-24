@@ -32,8 +32,37 @@ Logs are written to `logs\server.log` and also printed to the console when using
 - Chat history stored in `data/chat.db`.
 - Streaming chat uses `/api/threads/{thread_id}/messages/stream` (SSE).
 - Supported models: Azure OpenAI and Azure Grok (Entra ID), plus Gemini (API key).
-- Threads auto-title using the primary model after each exchange.
+- Threads auto-title using the final-response model after each exchange.
 - Master agent uses dynamic routing: if a task is simple and responder confidence is above the configured threshold, verifier can be skipped and output goes directly to polisher.
+
+## Multi-agent architecture
+
+- **Master routing agent** decides execution path for each request.
+- **Responder agent** creates the first draft.
+- **Verifier agent** validates/corrects when routing requires verification.
+- **Polisher agent** rewrites the final user-facing response.
+
+Default path is:
+
+`responder -> verifier -> polisher`
+
+Shortcut path (when enabled and confidence rule is met):
+
+`responder -> polisher`
+
+## Streaming behavior
+
+SSE now emits agent-based stages and routing metadata:
+
+- `status` / `token` events for `responder`, `verifier`, `polisher`
+- `routing` event with selected path and skip reason
+- `saved` / `title` / `done` events as before
+
+## Agent tools status
+
+- Microsoft Agent Framework dependency is included (`agent-framework`, preview).
+- Tool abstractions are added (`ToolRegistry`, `WebSearchTool`, tool traces) for per-agent tool usage.
+- `tools.web_search_enabled` is persisted in config and ready for runtime wiring to a concrete search backend.
 
 ## Azure OpenAI (Entra ID)
 
